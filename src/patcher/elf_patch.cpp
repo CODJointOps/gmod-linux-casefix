@@ -6,6 +6,8 @@
 #include <elf.h>
 #include <filesystem>
 #include <fstream>
+#include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -77,21 +79,18 @@ void write_file_atomic(const fs::path& path, const std::vector<std::byte>& bytes
     fs::rename(temp, path);
 }
 
-std::size_t align_up(std::size_t value, std::size_t alignment) {
-    const std::size_t mask = alignment - 1;
-    return (value + mask) & ~mask;
-}
-
 struct elf_file_t {
     std::vector<std::byte> bytes{};
     Elf64_Ehdr ehdr{};
     std::vector<Elf64_Phdr> phdrs{};
     std::size_t dynamic_index = 0;
-    std::size_t load_index = 0;
     std::vector<Elf64_Dyn> dynamic_entries{};
     std::size_t dynamic_entry_count = 0;
     std::size_t dynamic_offset = 0;
+    std::uint64_t dynamic_vaddr = 0;
+    std::size_t dynamic_size = 0;
     std::size_t dynstr_offset = 0;
+    std::uint64_t dynstr_vaddr = 0;
     std::size_t dynstr_size = 0;
 };
 
@@ -149,30 +148,19 @@ elf_file_t parse_elf64(const fs::path& path) {
     }
 
     bool found_dynamic = false;
-    std::uint64_t max_load_end = 0;
-    bool found_load = false;
     for (std::size_t i = 0; i < elf.phdrs.size(); ++i) {
         const auto& phdr = elf.phdrs[i];
         if (phdr.p_type == PT_DYNAMIC) {
             elf.dynamic_index = i;
             elf.dynamic_offset = static_cast<std::size_t>(phdr.p_offset);
+            elf.dynamic_vaddr = phdr.p_vaddr;
+            elf.dynamic_size = static_cast<std::size_t>(phdr.p_filesz);
             elf.dynamic_entry_count = static_cast<std::size_t>(phdr.p_filesz / sizeof(Elf64_Dyn));
             found_dynamic = true;
-        }
-        if (phdr.p_type == PT_LOAD) {
-            const std::uint64_t end = phdr.p_offset + phdr.p_filesz;
-            if (!found_load || end > max_load_end) {
-                max_load_end = end;
-                elf.load_index = i;
-                found_load = true;
-            }
         }
     }
     if (!found_dynamic) {
         throw std::runtime_error("PT_DYNAMIC not found");
-    }
-    if (!found_load) {
-        throw std::runtime_error("PT_LOAD not found");
     }
 
     elf.dynamic_entries.reserve(elf.dynamic_entry_count);
@@ -193,55 +181,12 @@ elf_file_t parse_elf64(const fs::path& path) {
         throw std::runtime_error("invalid dynamic string table");
     }
 
+    elf.dynstr_vaddr = dynstr_vaddr;
     elf.dynstr_offset = vaddr_to_offset(elf.phdrs, dynstr_vaddr);
-    if (elf.dynstr_offset + elf.dynstr_size > elf.bytes.size()) {
+    if (elf.dynstr_offset >= elf.bytes.size()) {
         throw std::runtime_error("dynamic string table out of range");
     }
     return elf;
-}
-
-void update_section_headers(std::vector<std::byte>& bytes,
-    const Elf64_Ehdr& ehdr,
-    std::size_t dynstr_offset,
-    std::uint64_t dynstr_vaddr,
-    std::size_t dynstr_size,
-    std::size_t dynamic_offset,
-    std::uint64_t dynamic_vaddr,
-    std::size_t dynamic_size) {
-    if (ehdr.e_shoff == 0 || ehdr.e_shentsize != sizeof(Elf64_Shdr) || ehdr.e_shnum == 0) {
-        return;
-    }
-    if (ehdr.e_shstrndx == SHN_UNDEF || ehdr.e_shstrndx >= ehdr.e_shnum) {
-        return;
-    }
-
-    const std::size_t shstr_hdr_off = ehdr.e_shoff + (ehdr.e_shstrndx * sizeof(Elf64_Shdr));
-    const auto shstr_hdr = read_struct<Elf64_Shdr>(bytes, shstr_hdr_off);
-    if (shstr_hdr.sh_offset + shstr_hdr.sh_size > bytes.size()) {
-        return;
-    }
-
-    for (std::size_t i = 0; i < ehdr.e_shnum; ++i) {
-        const std::size_t sh_off = ehdr.e_shoff + (i * sizeof(Elf64_Shdr));
-        auto shdr = read_struct<Elf64_Shdr>(bytes, sh_off);
-        const std::size_t name_off = shstr_hdr.sh_offset + shdr.sh_name;
-        if (name_off >= bytes.size()) {
-            continue;
-        }
-
-        const std::string name = read_c_string(bytes, name_off);
-        if (name == ".dynstr") {
-            shdr.sh_offset = dynstr_offset;
-            shdr.sh_addr = dynstr_vaddr;
-            shdr.sh_size = dynstr_size;
-            write_struct(bytes, sh_off, shdr);
-        } else if (name == ".dynamic") {
-            shdr.sh_offset = dynamic_offset;
-            shdr.sh_addr = dynamic_vaddr;
-            shdr.sh_size = dynamic_size;
-            write_struct(bytes, sh_off, shdr);
-        }
-    }
 }
 
 } // namespace
@@ -257,7 +202,8 @@ std::vector<std::string> list_needed(const fs::path& path) {
         if (dyn.d_tag != DT_NEEDED) {
             continue;
         }
-        const std::size_t name_off = elf.dynstr_offset + static_cast<std::size_t>(dyn.d_un.d_val);
+        const std::uint64_t name_vaddr = elf.dynstr_vaddr + dyn.d_un.d_val;
+        const std::size_t name_off = vaddr_to_offset(elf.phdrs, name_vaddr);
         needed.push_back(read_c_string(elf.bytes, name_off));
     }
     return needed;
@@ -272,87 +218,70 @@ bool add_needed(const fs::path& path, std::string_view needed_name) {
         }
     }
 
-    const std::size_t needed_offset = elf.dynstr_size;
-    const auto* old_dynstr = reinterpret_cast<const char*>(elf.bytes.data() + elf.dynstr_offset);
-    std::vector<char> new_dynstr(old_dynstr, old_dynstr + elf.dynstr_size);
-    new_dynstr.insert(new_dynstr.end(), needed_name.begin(), needed_name.end());
-    new_dynstr.push_back('\0');
-
-    std::vector<Elf64_Dyn> new_dynamic;
-    new_dynamic.reserve(elf.dynamic_entries.size() + 1);
-    for (const auto& dyn : elf.dynamic_entries) {
+    std::size_t null_index = elf.dynamic_entries.size();
+    std::optional<std::size_t> strsz_index;
+    for (std::size_t i = 0; i < elf.dynamic_entries.size(); ++i) {
+        const auto& dyn = elf.dynamic_entries[i];
+        if (dyn.d_tag == DT_STRSZ) {
+            strsz_index = i;
+        }
         if (dyn.d_tag == DT_NULL) {
+            null_index = i;
             break;
         }
-        new_dynamic.push_back(dyn);
     }
+    if (null_index == elf.dynamic_entries.size()) {
+        throw std::runtime_error("DT_NULL not found");
+    }
+    if (!strsz_index) {
+        throw std::runtime_error("DT_STRSZ not found");
+    }
+
+    const std::size_t string_entry_index = null_index + 2;
+    const std::size_t string_entry_offset = string_entry_index * sizeof(Elf64_Dyn);
+    if (string_entry_offset > elf.dynamic_size) {
+        throw std::runtime_error("not enough spare dynamic entries");
+    }
+
+    const std::size_t string_capacity = elf.dynamic_size - string_entry_offset;
+    const std::size_t string_size = needed_name.size() + 1;
+    if (string_capacity < string_size) {
+        throw std::runtime_error("not enough spare dynamic storage for " + std::string(needed_name));
+    }
+
+    const std::uint64_t string_vaddr = elf.dynamic_vaddr + string_entry_offset;
+    if (string_vaddr < elf.dynstr_vaddr) {
+        throw std::runtime_error("invalid dynamic string placement");
+    }
+
+    const std::uint64_t needed_offset_u64 = string_vaddr - elf.dynstr_vaddr;
+    if (needed_offset_u64 > std::numeric_limits<std::size_t>::max()) {
+        throw std::runtime_error("dynamic string offset too large");
+    }
+    const std::size_t needed_offset = static_cast<std::size_t>(needed_offset_u64);
+
+    const std::size_t string_file_offset = elf.dynamic_offset + string_entry_offset;
+    if (string_file_offset + string_size > elf.bytes.size()) {
+        throw std::runtime_error("dynamic string storage out of range");
+    }
+
+    std::fill(elf.bytes.begin() + static_cast<std::ptrdiff_t>(string_file_offset),
+        elf.bytes.begin() + static_cast<std::ptrdiff_t>(string_file_offset + string_capacity),
+        std::byte{0});
+    std::memcpy(elf.bytes.data() + string_file_offset, needed_name.data(), needed_name.size());
 
     Elf64_Dyn needed_dyn{};
     needed_dyn.d_tag = DT_NEEDED;
     needed_dyn.d_un.d_val = needed_offset;
-    new_dynamic.push_back(needed_dyn);
-    new_dynamic.push_back(Elf64_Dyn{});
+    write_struct(elf.bytes, elf.dynamic_offset + (null_index * sizeof(Elf64_Dyn)), needed_dyn);
+    write_struct(elf.bytes, elf.dynamic_offset + ((null_index + 1) * sizeof(Elf64_Dyn)), Elf64_Dyn{});
 
-    auto& load = elf.phdrs[elf.load_index];
-    auto& dynamic = elf.phdrs[elf.dynamic_index];
-
-    std::size_t append_off = align_up(elf.bytes.size(), 8);
-    if (append_off > elf.bytes.size()) {
-        elf.bytes.resize(append_off, std::byte{0});
+    auto strsz_dyn = elf.dynamic_entries[*strsz_index];
+    const std::uint64_t required_strsz = needed_offset_u64 + string_size;
+    if (strsz_dyn.d_un.d_val < required_strsz) {
+        strsz_dyn.d_un.d_val = required_strsz;
+        write_struct(elf.bytes, elf.dynamic_offset + (*strsz_index * sizeof(Elf64_Dyn)), strsz_dyn);
     }
-
-    const std::size_t dynstr_offset = append_off;
-    elf.bytes.insert(elf.bytes.end(),
-        reinterpret_cast<const std::byte*>(new_dynstr.data()),
-        reinterpret_cast<const std::byte*>(new_dynstr.data() + new_dynstr.size()));
-
-    const std::size_t dynamic_offset = align_up(elf.bytes.size(), 8);
-    if (dynamic_offset > elf.bytes.size()) {
-        elf.bytes.resize(dynamic_offset, std::byte{0});
-    }
-
-    const std::size_t dynamic_size = new_dynamic.size() * sizeof(Elf64_Dyn);
-    const std::size_t dynamic_start = elf.bytes.size();
-    elf.bytes.resize(dynamic_start + dynamic_size);
-    std::memcpy(elf.bytes.data() + dynamic_start, new_dynamic.data(), dynamic_size);
-
-    const auto dynstr_vaddr = static_cast<std::uint64_t>(load.p_vaddr + (dynstr_offset - load.p_offset));
-    const auto dynamic_vaddr = static_cast<std::uint64_t>(load.p_vaddr + (dynamic_offset - load.p_offset));
-
-    auto* dyn_entries = reinterpret_cast<Elf64_Dyn*>(elf.bytes.data() + dynamic_start);
-    for (std::size_t i = 0; i < new_dynamic.size(); ++i) {
-        if (dyn_entries[i].d_tag == DT_STRTAB) {
-            dyn_entries[i].d_un.d_ptr = dynstr_vaddr;
-        } else if (dyn_entries[i].d_tag == DT_STRSZ) {
-            dyn_entries[i].d_un.d_val = new_dynstr.size();
-        }
-    }
-
-    const std::size_t new_load_end = elf.bytes.size();
-    const std::size_t load_start = static_cast<std::size_t>(load.p_offset);
-    const std::size_t new_load_size = new_load_end - load_start;
-    load.p_filesz = new_load_size;
-    load.p_memsz = std::max<std::uint64_t>(load.p_memsz, new_load_size);
-
-    dynamic.p_offset = dynamic_offset;
-    dynamic.p_vaddr = dynamic_vaddr;
-    dynamic.p_paddr = dynamic_vaddr;
-    dynamic.p_filesz = dynamic_size;
-    dynamic.p_memsz = dynamic_size;
-
-    for (std::size_t i = 0; i < elf.phdrs.size(); ++i) {
-        const std::size_t phoff = elf.ehdr.e_phoff + (i * sizeof(Elf64_Phdr));
-        write_struct(elf.bytes, phoff, elf.phdrs[i]);
-    }
-
-    update_section_headers(elf.bytes,
-        elf.ehdr,
-        dynstr_offset,
-        dynstr_vaddr,
-        new_dynstr.size(),
-        dynamic_offset,
-        dynamic_vaddr,
-        dynamic_size);
 
     write_file_atomic(path, elf.bytes);
     return true;

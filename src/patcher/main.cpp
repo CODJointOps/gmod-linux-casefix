@@ -20,6 +20,7 @@ namespace {
 constexpr std::string_view k_client_target_rel = "bin/linux64/filesystem_stdio_client.so";
 constexpr std::string_view k_server_target_rel = "bin/linux64/filesystem_stdio.so";
 constexpr std::string_view k_backup_dir_rel = "bin/linux64/.gmod-fixes-backup";
+constexpr std::string_view k_swiftshader_dir_rel = "bin/linux64/swiftshader";
 constexpr std::string_view k_client_helper = "libgmod_casefix_client.so";
 constexpr std::string_view k_server_helper = "libgmod_casefix_server.so";
 
@@ -28,9 +29,21 @@ struct target_patch_t {
     fs::path relative_target{};
 };
 
+struct swiftshader_link_t {
+    fs::path link_name{};
+    fs::path target{};
+};
+
 const std::array<target_patch_t, 2> k_targets = {{
     {std::string(k_client_helper), fs::path(k_client_target_rel)},
     {std::string(k_server_helper), fs::path(k_server_target_rel)},
+}};
+
+const std::array<swiftshader_link_t, 4> k_swiftshader_links = {{
+    {fs::path("libGLESv2.so"), fs::path("../libGLESv2.so")},
+    {fs::path("libEGL.so"), fs::path("../libEGL.so")},
+    {fs::path("libvk_swiftshader.so"), fs::path("../libvk_swiftshader.so")},
+    {fs::path("vk_swiftshader_icd.json"), fs::path("../vk_swiftshader_icd.json")},
 }};
 
 std::vector<std::string> print_needed(const fs::path& target) {
@@ -145,12 +158,10 @@ void copy_replace(const fs::path& from, const fs::path& to) {
     fs::permissions(to, fs::status(from).permissions(), fs::perm_options::replace);
 }
 
-void backup_if_missing(const fs::path& game_dir, const fs::path& target_rel) {
+void backup_clean_target(const fs::path& game_dir, const fs::path& target_rel) {
     const fs::path target = game_dir / target_rel;
     const fs::path backup = game_dir / k_backup_dir_rel / target_rel.filename();
-    if (!fs::exists(backup)) {
-        copy_replace(target, backup);
-    }
+    copy_replace(target, backup);
 }
 
 bool restore_backup(const fs::path& game_dir, const fs::path& target_rel) {
@@ -173,7 +184,6 @@ bool apply_one(const fs::path& game_dir, const target_patch_t& target) {
         throw std::runtime_error("helper not found next to patcher: " + helper_src.string());
     }
 
-    backup_if_missing(game_dir, target.relative_target);
     copy_replace(helper_src, helper_dst);
 
     if (has_needed(target_path, target.helper_name)) {
@@ -181,6 +191,7 @@ bool apply_one(const fs::path& game_dir, const target_patch_t& target) {
         return false;
     }
 
+    backup_clean_target(game_dir, target.relative_target);
     elf_patch::add_needed(target_path, target.helper_name);
 
     std::cout << "patched: " << target_path << " -> " << target.helper_name << '\n';
@@ -200,6 +211,61 @@ bool remove_one(const fs::path& game_dir, const target_patch_t& target) {
         std::cout << "no backup: " << (game_dir / target.relative_target) << '\n';
     }
     return restored;
+}
+
+bool ensure_swiftshader_layout(const fs::path& game_dir) {
+    const fs::path swiftshader_dir = game_dir / k_swiftshader_dir_rel;
+    bool changed = false;
+
+    for (const auto& link : k_swiftshader_links) {
+        const fs::path source = (swiftshader_dir / link.target).lexically_normal();
+        if (!fs::exists(source)) {
+            std::cout << "swiftshader source missing: " << source << '\n';
+            continue;
+        }
+
+        fs::create_directories(swiftshader_dir);
+        const fs::path link_path = swiftshader_dir / link.link_name;
+        const auto status = fs::symlink_status(link_path);
+        if (fs::is_symlink(status)) {
+            if (fs::read_symlink(link_path) == link.target) {
+                continue;
+            }
+            fs::remove(link_path);
+        } else if (fs::exists(status)) {
+            std::cout << "swiftshader file already exists: " << link_path << '\n';
+            continue;
+        }
+
+        fs::create_symlink(link.target, link_path);
+        std::cout << "linked: " << link_path << " -> " << link.target.string() << '\n';
+        changed = true;
+    }
+
+    return changed;
+}
+
+bool remove_swiftshader_layout(const fs::path& game_dir) {
+    const fs::path swiftshader_dir = game_dir / k_swiftshader_dir_rel;
+    bool changed = false;
+
+    for (const auto& link : k_swiftshader_links) {
+        const fs::path link_path = swiftshader_dir / link.link_name;
+        const auto status = fs::symlink_status(link_path);
+        if (!fs::is_symlink(status) || fs::read_symlink(link_path) != link.target) {
+            continue;
+        }
+
+        fs::remove(link_path);
+        std::cout << "removed: " << link_path << '\n';
+        changed = true;
+    }
+
+    if (fs::exists(swiftshader_dir) && fs::is_empty(swiftshader_dir)) {
+        fs::remove(swiftshader_dir);
+    }
+
+    return changed;
 }
 
 void status_one(const fs::path& game_dir, const target_patch_t& target) {
@@ -223,6 +289,22 @@ void status_one(const fs::path& game_dir, const target_patch_t& target) {
         std::cout << "  needed: error: " << needed_err << '\n';
     }
     std::cout << "  backup: " << (fs::exists(backup) ? "present" : "missing") << '\n';
+}
+
+void status_swiftshader_layout(const fs::path& game_dir) {
+    const fs::path swiftshader_dir = game_dir / k_swiftshader_dir_rel;
+
+    std::cout << k_swiftshader_dir_rel << '\n';
+    for (const auto& link : k_swiftshader_links) {
+        const fs::path link_path = swiftshader_dir / link.link_name;
+        const auto status = fs::symlink_status(link_path);
+        std::cout << "  " << link.link_name.string() << ": ";
+        if (fs::is_symlink(status)) {
+            std::cout << "symlink -> " << fs::read_symlink(link_path).string() << '\n';
+        } else {
+            std::cout << (fs::exists(status) ? "present" : "missing") << '\n';
+        }
+    }
 }
 
 void usage() {
@@ -267,6 +349,7 @@ int main(int argc, char** argv) {
             for (const auto& target : k_targets) {
                 status_one(*game_dir, target);
             }
+            status_swiftshader_layout(*game_dir);
             return 0;
         }
 
@@ -275,6 +358,7 @@ int main(int argc, char** argv) {
             for (const auto& target : k_targets) {
                 changed |= apply_one(*game_dir, target);
             }
+            changed |= ensure_swiftshader_layout(*game_dir);
             std::cout << (changed ? "apply: changed\n" : "apply: no-op\n");
             return 0;
         }
@@ -284,6 +368,7 @@ int main(int argc, char** argv) {
             for (const auto& target : k_targets) {
                 changed |= remove_one(*game_dir, target);
             }
+            changed |= remove_swiftshader_layout(*game_dir);
             std::cout << (changed ? "remove: changed\n" : "remove: no-op\n");
             return 0;
         }
