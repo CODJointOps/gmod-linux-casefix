@@ -72,6 +72,10 @@ int hook_xstat(int ver, const char* path, struct stat* buf) {
         errno = ENOSYS;
         return -1;
     }
+    if (negative_lookup_blocks(path)) {
+        errno = ENOENT;
+        return -1;
+    }
     const int ret = s.orig_xstat(ver, path, buf);
     if (ret == 0) {
         return ret;
@@ -92,6 +96,10 @@ int hook_xstat64(int ver, const char* path, struct stat64* buf) {
     auto& s = state();
     if (!s.orig_xstat64) {
         errno = ENOSYS;
+        return -1;
+    }
+    if (negative_lookup_blocks(path)) {
+        errno = ENOENT;
         return -1;
     }
     const int ret = s.orig_xstat64(ver, path, buf);
@@ -126,6 +134,10 @@ int hook_open(const char* path, int flags, ...) {
         va_end(ap);
     }
 
+    if (!open_has_write_intent(flags) && negative_lookup_blocks(path)) {
+        errno = ENOENT;
+        return -1;
+    }
     const int ret = has_mode
         ? s.orig_open(path, flags, mode)
         : s.orig_open(path, flags);
@@ -152,6 +164,10 @@ FILE* hook_fopen64(const char* path, const char* mode) {
         errno = ENOSYS;
         return nullptr;
     }
+    if (!fopen_has_write_intent(mode) && negative_lookup_blocks(path)) {
+        errno = ENOENT;
+        return nullptr;
+    }
     FILE* file = s.orig_fopen64(path, mode);
     if (file != nullptr || fopen_has_write_intent(mode)) {
         return file;
@@ -172,6 +188,10 @@ void* hook_filebuf_open(void* self, const char* path, std::ios_base::openmode mo
     auto& s = state();
     if (!s.orig_filebuf_open) {
         errno = ENOSYS;
+        return nullptr;
+    }
+    if (!filebuf_has_write_intent(mode) && negative_lookup_blocks(path)) {
+        errno = ENOENT;
         return nullptr;
     }
     void* file = s.orig_filebuf_open(self, path, mode);
@@ -196,6 +216,10 @@ DIR* hook_opendir(const char* path) {
         errno = ENOSYS;
         return nullptr;
     }
+    if (negative_lookup_blocks(path)) {
+        errno = ENOENT;
+        return nullptr;
+    }
     DIR* dir = s.orig_opendir(path);
     if (dir != nullptr) {
         return dir;
@@ -218,6 +242,10 @@ int hook_scandir64(const char* path, struct dirent64*** namelist,
     auto& s = state();
     if (!s.orig_scandir64) {
         errno = ENOSYS;
+        return -1;
+    }
+    if (negative_lookup_blocks(path)) {
+        errno = ENOENT;
         return -1;
     }
     const int ret = s.orig_scandir64(path, namelist, filter, compar);

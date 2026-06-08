@@ -6,6 +6,7 @@
 #include <array>
 #include <cerrno>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <dirent.h>
 #include <limits.h>
@@ -35,6 +36,7 @@ struct resolver_state_t {
     std::unordered_map<std::string, std::string, sv_hash, std::equal_to<>> resolved_cache{};
     std::unordered_set<std::string, sv_hash, std::equal_to<>> missing_cache{};
     std::uint64_t cache_generation = 1;
+    std::uint64_t missing_epoch = 0;
 };
 
 resolver_state_t& resolver_state() {
@@ -42,8 +44,30 @@ resolver_state_t& resolver_state() {
     return state;
 }
 
+// A genuinely-missing probe is re-issued by the engine every frame across ~25
+// search roots, so a negative result is cached and the real syscall is skipped.
+// The cache expires every k_negative_ttl_seconds so content downloaded
+// mid-session re-resolves within that window instead of staying ERROR forever.
+constexpr std::uint64_t k_negative_ttl_seconds = 2;
+
+std::uint64_t current_epoch() {
+    const auto now = std::chrono::steady_clock::now().time_since_epoch();
+    const auto secs = std::chrono::duration_cast<std::chrono::seconds>(now).count();
+    return static_cast<std::uint64_t>(secs) / k_negative_ttl_seconds;
+}
+
+// Clears the shared negative cache when the time bucket rolls. Must hold mutex.
+void roll_missing_epoch_locked() {
+    const std::uint64_t now = current_epoch();
+    if (resolver_state().missing_epoch != now) {
+        resolver_state().missing_epoch = now;
+        resolver_state().missing_cache.clear();
+    }
+}
+
 struct tls_missing_entry {
     std::uint64_t generation = 0;
+    std::uint64_t epoch = 0;
     std::uint64_t hash = 0;
     std::string key{};
 };
@@ -68,6 +92,7 @@ bool tls_missing_cache_contains(std::string_view key) {
     const std::uint64_t hash = fast_path_hash(key);
     auto& entry = tls_missing_cache()[hash & (k_tls_missing_cache_slots - 1u)];
     return entry.generation == resolver_state().cache_generation &&
+           entry.epoch == current_epoch() &&
            entry.hash == hash &&
            entry.key == key;
 }
@@ -76,6 +101,7 @@ void tls_missing_cache_store(std::string_view key) {
     const std::uint64_t hash = fast_path_hash(key);
     auto& entry = tls_missing_cache()[hash & (k_tls_missing_cache_slots - 1u)];
     entry.generation = resolver_state().cache_generation;
+    entry.epoch = current_epoch();
     entry.hash = hash;
     entry.key.assign(key);
 }
@@ -194,6 +220,23 @@ const std::string& process_cwd() {
     return cwd;
 }
 
+// Builds the cache key for raw_path into scratch and returns a view valid until
+// this thread's next call. Empty view means the path cannot be keyed.
+std::string_view make_key_view(const char* raw_path, std::string& scratch, bool& absolute) {
+    absolute = raw_path[0] == '/' || raw_path[0] == '\\';
+    if (absolute) {
+        return std::string_view(raw_path);
+    }
+    const std::string& cwd = process_cwd();
+    if (cwd.empty()) {
+        return {};
+    }
+    scratch.assign(cwd);
+    scratch.push_back('\n');
+    scratch.append(raw_path);
+    return scratch;
+}
+
 } // namespace
 
 bool should_retry_missing(int err) {
@@ -218,25 +261,38 @@ bool fopen_has_write_intent(const char* mode) {
     return false;
 }
 
+bool negative_lookup_blocks(const char* raw_path) {
+    if (!raw_path || !raw_path[0]) {
+        return false;
+    }
+    thread_local std::string block_scratch{};
+    bool absolute = false;
+    const std::string_view key_view = make_key_view(raw_path, block_scratch, absolute);
+    if (key_view.empty()) {
+        return false;
+    }
+    if (tls_missing_cache_contains(key_view)) {
+        return true;
+    }
+    std::lock_guard lock(resolver_state().mutex);
+    roll_missing_epoch_locked();
+    if (resolver_state().missing_cache.contains(key_view)) {
+        tls_missing_cache_store(key_view);
+        return true;
+    }
+    return false;
+}
+
 std::string resolve_case_mismatched_path(const char* raw_path) {
     if (!raw_path || !raw_path[0]) {
         return {};
     }
 
-    const bool absolute = raw_path[0] == '/' || raw_path[0] == '\\';
     thread_local std::string key_scratch{};
-    std::string_view cache_key{};
-    if (absolute) {
-        cache_key = raw_path;
-    } else {
-        const std::string& cwd = process_cwd();
-        if (cwd.empty()) {
-            return {};
-        }
-        key_scratch.assign(cwd);
-        key_scratch.push_back('\n');
-        key_scratch.append(raw_path);
-        cache_key = key_scratch;
+    bool absolute = false;
+    const std::string_view cache_key = make_key_view(raw_path, key_scratch, absolute);
+    if (cache_key.empty()) {
+        return {};
     }
 
     if (tls_missing_cache_contains(cache_key)) {
@@ -244,6 +300,7 @@ std::string resolve_case_mismatched_path(const char* raw_path) {
     }
     {
         std::lock_guard lock(resolver_state().mutex);
+        roll_missing_epoch_locked();
         if (const auto it = resolver_state().resolved_cache.find(cache_key); it != resolver_state().resolved_cache.end()) {
             return it->second;
         }
@@ -279,6 +336,7 @@ std::string resolve_case_mismatched_path(const char* raw_path) {
         std::string matched{};
         if (!find_case_match_in_dir(current, part, matched)) {
             std::lock_guard lock(resolver_state().mutex);
+            roll_missing_epoch_locked();
             resolver_state().missing_cache.insert(std::string(cache_key));
             tls_missing_cache_store(cache_key);
             return {};
