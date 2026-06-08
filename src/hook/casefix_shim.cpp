@@ -9,6 +9,7 @@
 #include <dirent.h>
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <ios>
 #include <mutex>
 #include <sys/stat.h>
 
@@ -18,6 +19,7 @@ using xstat_fn = int (*)(int, const char*, struct stat*);
 using xstat64_fn = int (*)(int, const char*, struct stat64*);
 using open_fn = int (*)(const char*, int, ...);
 using fopen64_fn = FILE* (*)(const char*, const char*);
+using filebuf_open_fn = void* (*)(void*, const char*, std::ios_base::openmode);
 using opendir_fn = DIR* (*)(const char*);
 using scandir64_fn = int (*)(const char*, struct dirent64***,
     int (*)(const struct dirent64*),
@@ -30,6 +32,7 @@ struct state_t {
     xstat64_fn orig_xstat64 = nullptr;
     open_fn orig_open = nullptr;
     fopen64_fn orig_fopen64 = nullptr;
+    filebuf_open_fn orig_filebuf_open = nullptr;
     opendir_fn orig_opendir = nullptr;
     scandir64_fn orig_scandir64 = nullptr;
 };
@@ -38,6 +41,9 @@ state_t& state() {
     static state_t s{};
     return s;
 }
+
+constexpr const char* k_filebuf_open_symbol =
+    "_ZNSt13basic_filebufIcSt11char_traitsIcEE4openEPKcSt13_Ios_Openmode";
 
 template <typename T>
 void resolve_next_symbol(T& slot, const char* name) {
@@ -52,6 +58,12 @@ bool open_has_write_intent(int flags) {
            (flags & O_APPEND) != 0 ||
            (flags & O_WRONLY) != 0 ||
            (flags & O_RDWR) != 0;
+}
+
+bool filebuf_has_write_intent(std::ios_base::openmode mode) {
+    return (mode & std::ios_base::out) != 0 ||
+           (mode & std::ios_base::app) != 0 ||
+           (mode & std::ios_base::trunc) != 0;
 }
 
 int hook_xstat(int ver, const char* path, struct stat* buf) {
@@ -156,6 +168,28 @@ FILE* hook_fopen64(const char* path, const char* mode) {
     return s.orig_fopen64(resolved.c_str(), mode);
 }
 
+void* hook_filebuf_open(void* self, const char* path, std::ios_base::openmode mode) {
+    auto& s = state();
+    if (!s.orig_filebuf_open) {
+        errno = ENOSYS;
+        return nullptr;
+    }
+    void* file = s.orig_filebuf_open(self, path, mode);
+    if (file != nullptr || filebuf_has_write_intent(mode)) {
+        return file;
+    }
+    const int err = errno;
+    if (!should_retry_missing(err)) {
+        return file;
+    }
+    const std::string resolved = resolve_case_mismatched_path(path);
+    if (resolved.empty()) {
+        errno = err;
+        return file;
+    }
+    return s.orig_filebuf_open(self, resolved.c_str(), mode);
+}
+
 DIR* hook_opendir(const char* path) {
     auto& s = state();
     if (!s.orig_opendir) {
@@ -213,6 +247,7 @@ void install_hooks() {
     resolve_next_symbol(s.orig_xstat64, "__xstat64");
     resolve_next_symbol(s.orig_open, "open");
     resolve_next_symbol(s.orig_fopen64, "fopen64");
+    resolve_next_symbol(s.orig_filebuf_open, k_filebuf_open_symbol);
     resolve_next_symbol(s.orig_opendir, "opendir");
     resolve_next_symbol(s.orig_scandir64, "scandir64");
 
@@ -225,6 +260,9 @@ void install_hooks() {
         reinterpret_cast<void**>(&s.orig_open)) ? 1 : 0;
     hooks_installed += install_got_hook("fopen64", reinterpret_cast<void*>(&hook_fopen64),
         reinterpret_cast<void**>(&s.orig_fopen64)) ? 1 : 0;
+    hooks_installed += install_got_hook(k_filebuf_open_symbol,
+        reinterpret_cast<void*>(&hook_filebuf_open),
+        reinterpret_cast<void**>(&s.orig_filebuf_open)) ? 1 : 0;
     hooks_installed += install_got_hook("opendir", reinterpret_cast<void*>(&hook_opendir),
         reinterpret_cast<void**>(&s.orig_opendir)) ? 1 : 0;
     hooks_installed += install_got_hook("scandir64", reinterpret_cast<void*>(&hook_scandir64),
