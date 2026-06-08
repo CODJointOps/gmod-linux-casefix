@@ -3,8 +3,10 @@
 #include "common/casefix_debug.h"
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cctype>
+#include <cstdint>
 #include <dirent.h>
 #include <limits.h>
 #include <mutex>
@@ -16,15 +18,76 @@
 
 namespace {
 
+struct sv_hash {
+    using is_transparent = void;
+    std::size_t operator()(std::string_view sv) const noexcept {
+        return std::hash<std::string_view>{}(sv);
+    }
+};
+
 struct resolver_state_t {
+    resolver_state_t() {
+        resolved_cache.reserve(512);
+        missing_cache.reserve(4096);
+    }
+
     std::mutex mutex{};
-    std::unordered_map<std::string, std::string> resolved_cache{};
-    std::unordered_set<std::string> missing_cache{};
+    std::unordered_map<std::string, std::string, sv_hash, std::equal_to<>> resolved_cache{};
+    std::unordered_set<std::string, sv_hash, std::equal_to<>> missing_cache{};
+    std::uint64_t cache_generation = 1;
 };
 
 resolver_state_t& resolver_state() {
     static resolver_state_t state{};
     return state;
+}
+
+struct tls_missing_entry {
+    std::uint64_t generation = 0;
+    std::uint64_t hash = 0;
+    std::string key{};
+};
+
+constexpr std::size_t k_tls_missing_cache_slots = 256;
+
+std::uint64_t fast_path_hash(std::string_view text) {
+    std::uint64_t hash = 1469598103934665603ull;
+    for (const unsigned char ch : text) {
+        hash ^= ch;
+        hash *= 1099511628211ull;
+    }
+    return hash ? hash : 1ull;
+}
+
+std::array<tls_missing_entry, k_tls_missing_cache_slots>& tls_missing_cache() {
+    thread_local std::array<tls_missing_entry, k_tls_missing_cache_slots> cache{};
+    return cache;
+}
+
+bool tls_missing_cache_contains(std::string_view key) {
+    const std::uint64_t hash = fast_path_hash(key);
+    auto& entry = tls_missing_cache()[hash & (k_tls_missing_cache_slots - 1u)];
+    return entry.generation == resolver_state().cache_generation &&
+           entry.hash == hash &&
+           entry.key == key;
+}
+
+void tls_missing_cache_store(std::string_view key) {
+    const std::uint64_t hash = fast_path_hash(key);
+    auto& entry = tls_missing_cache()[hash & (k_tls_missing_cache_slots - 1u)];
+    entry.generation = resolver_state().cache_generation;
+    entry.hash = hash;
+    entry.key.assign(key);
+}
+
+void tls_missing_cache_erase(std::string_view key) {
+    const std::uint64_t hash = fast_path_hash(key);
+    auto& entry = tls_missing_cache()[hash & (k_tls_missing_cache_slots - 1u)];
+    if (entry.generation == resolver_state().cache_generation &&
+        entry.hash == hash &&
+        entry.key == key) {
+        entry = {};
+    }
 }
 
 bool ascii_ieq(char lhs, char rhs) {
@@ -123,15 +186,12 @@ bool find_case_match_in_dir(const std::string& dir_path, std::string_view needle
     return matches == 1;
 }
 
-std::string make_cache_key(const std::string& normalized_path, bool absolute, const std::string& cwd) {
-    if (absolute) {
-        return normalized_path;
-    }
-
-    std::string key = cwd;
-    key.push_back('\n');
-    key.append(normalized_path);
-    return key;
+const std::string& process_cwd() {
+    static const std::string cwd = [] {
+        char buf[PATH_MAX]{};
+        return ::getcwd(buf, sizeof(buf)) ? std::string(buf) : std::string{};
+    }();
+    return cwd;
 }
 
 } // namespace
@@ -163,30 +223,38 @@ std::string resolve_case_mismatched_path(const char* raw_path) {
         return {};
     }
 
-    const std::string normalized = normalize_path(raw_path);
-    const bool absolute = !normalized.empty() && normalized.front() == '/';
-
-    char cwd_buf[PATH_MAX] = {};
-    std::string cwd{};
-    if (!absolute) {
-        if (!::getcwd(cwd_buf, sizeof(cwd_buf))) {
+    const bool absolute = raw_path[0] == '/' || raw_path[0] == '\\';
+    thread_local std::string key_scratch{};
+    std::string_view cache_key{};
+    if (absolute) {
+        cache_key = raw_path;
+    } else {
+        const std::string& cwd = process_cwd();
+        if (cwd.empty()) {
             return {};
         }
-        cwd.assign(cwd_buf);
+        key_scratch.assign(cwd);
+        key_scratch.push_back('\n');
+        key_scratch.append(raw_path);
+        cache_key = key_scratch;
     }
 
-    const std::string cache_key = make_cache_key(normalized, absolute, cwd);
+    if (tls_missing_cache_contains(cache_key)) {
+        return {};
+    }
     {
         std::lock_guard lock(resolver_state().mutex);
         if (const auto it = resolver_state().resolved_cache.find(cache_key); it != resolver_state().resolved_cache.end()) {
             return it->second;
         }
         if (resolver_state().missing_cache.contains(cache_key)) {
+            tls_missing_cache_store(cache_key);
             return {};
         }
     }
 
-    std::string current = absolute ? "/" : cwd;
+    const std::string normalized = normalize_path(raw_path);
+    std::string current = absolute ? "/" : process_cwd();
     std::size_t pos = absolute ? 1 : 0;
     while (pos <= normalized.size()) {
         const std::size_t next = normalized.find('/', pos);
@@ -211,20 +279,24 @@ std::string resolve_case_mismatched_path(const char* raw_path) {
         std::string matched{};
         if (!find_case_match_in_dir(current, part, matched)) {
             std::lock_guard lock(resolver_state().mutex);
-            resolver_state().missing_cache.insert(cache_key);
+            resolver_state().missing_cache.insert(std::string(cache_key));
+            tls_missing_cache_store(cache_key);
             return {};
         }
         current = append_component(current, matched);
     }
 
     if (current.empty()) {
-        current = absolute ? "/" : cwd;
+        current = absolute ? "/" : process_cwd();
     }
 
     {
         std::lock_guard lock(resolver_state().mutex);
-        resolver_state().missing_cache.erase(cache_key);
-        resolver_state().resolved_cache[cache_key] = current;
+        if (const auto it = resolver_state().missing_cache.find(cache_key); it != resolver_state().missing_cache.end()) {
+            resolver_state().missing_cache.erase(it);
+            tls_missing_cache_erase(cache_key);
+        }
+        resolver_state().resolved_cache.insert_or_assign(std::string(cache_key), current);
     }
 
     debug_log("fixed path='%s' resolved='%s'", raw_path, current.c_str());
