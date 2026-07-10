@@ -303,7 +303,7 @@ void install_hooks() {
 } // namespace
 
 __attribute__((constructor))
-static void gmod_patch_fs_ctor() {
+static void css_patch_fs_ctor() {
     debug_log("constructor loaded target=%s log=%s", k_target_module, patch_log::path());
     install_hooks();
 }

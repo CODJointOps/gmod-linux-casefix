@@ -17,34 +17,20 @@ namespace fs = std::filesystem;
 
 namespace {
 
-// One helper, one host file. filesystem_stdio_client.so is loaded by the game
-// client (and by listen servers, which run in-process), so patching it covers
-// every player. Standalone dedicated servers (filesystem_stdio.so) are out of
-// scope -- a rare, technical case that doesn't need this.
-constexpr std::string_view k_client_target_rel = "bin/linux64/filesystem_stdio_client.so";
-constexpr std::string_view k_backup_dir_rel = "bin/linux64/.gmod-fixes-backup";
-constexpr std::string_view k_swiftshader_dir_rel = "bin/linux64/swiftshader";
-constexpr std::string_view k_helper = "libgmod_patch.so";
+// CSS ships filesystem_stdio.so (no _client suffix) and loads it from the same
+// bin/linux64 directory. It covers both client and listen server since CSS runs
+// the listen server in-process like every other Source game.
+constexpr std::string_view k_client_target_rel = "bin/linux64/filesystem_stdio.so";
+constexpr std::string_view k_backup_dir_rel = "bin/linux64/.css-fixes-backup";
+constexpr std::string_view k_helper = "libcss_patch.so";
 
 struct target_patch_t {
     std::string helper_name{};
     fs::path relative_target{};
 };
 
-struct swiftshader_link_t {
-    fs::path link_name{};
-    fs::path target{};
-};
-
 const std::array<target_patch_t, 1> k_targets = {{
     {std::string(k_helper), fs::path(k_client_target_rel)},
-}};
-
-const std::array<swiftshader_link_t, 4> k_swiftshader_links = {{
-    {fs::path("libGLESv2.so"), fs::path("../libGLESv2.so")},
-    {fs::path("libEGL.so"), fs::path("../libEGL.so")},
-    {fs::path("libvk_swiftshader.so"), fs::path("../libvk_swiftshader.so")},
-    {fs::path("vk_swiftshader_icd.json"), fs::path("../vk_swiftshader_icd.json")},
 }};
 
 std::vector<std::string> print_needed(const fs::path& target) {
@@ -70,8 +56,8 @@ fs::path exe_dir() {
     return fs::path(buf.data()).parent_path();
 }
 
-bool is_gmod_root(const fs::path& root) {
-    return fs::exists(root / "hl2.sh") &&
+bool is_css_root(const fs::path& root) {
+    return fs::exists(root / "cstrike.sh") &&
            fs::exists(root / k_client_target_rel);
 }
 
@@ -103,7 +89,7 @@ std::vector<fs::path> parse_libraryfolders(const fs::path& vdf_path) {
 
 std::vector<fs::path> candidate_roots() {
     std::vector<fs::path> roots;
-    if (const char* env = std::getenv("GMOD_DIR"); env && env[0]) {
+    if (const char* env = std::getenv("CSS_DIR"); env && env[0]) {
         roots.emplace_back(env);
     }
 
@@ -120,10 +106,10 @@ std::vector<fs::path> candidate_roots() {
     }};
 
     for (const auto& steamapps_root : steamapps) {
-        roots.push_back(steamapps_root / "common/GarrysMod");
+        roots.push_back(steamapps_root / "common/Counter-Strike Source");
         const auto libs = parse_libraryfolders(steamapps_root / "libraryfolders.vdf");
         for (const auto& lib : libs) {
-            roots.push_back(lib / "steamapps/common/GarrysMod");
+            roots.push_back(lib / "steamapps/common/Counter-Strike Source");
         }
     }
     return roots;
@@ -131,14 +117,14 @@ std::vector<fs::path> candidate_roots() {
 
 std::optional<fs::path> find_game_dir(const std::optional<fs::path>& override_path) {
     if (override_path) {
-        if (is_gmod_root(*override_path)) {
+        if (is_css_root(*override_path)) {
             return fs::canonical(*override_path);
         }
         return std::nullopt;
     }
 
     for (const auto& candidate : candidate_roots()) {
-        if (is_gmod_root(candidate)) {
+        if (is_css_root(candidate)) {
             return fs::canonical(candidate);
         }
     }
@@ -213,61 +199,6 @@ bool remove_one(const fs::path& game_dir, const target_patch_t& target) {
     return restored;
 }
 
-bool ensure_swiftshader_layout(const fs::path& game_dir) {
-    const fs::path swiftshader_dir = game_dir / k_swiftshader_dir_rel;
-    bool changed = false;
-
-    for (const auto& link : k_swiftshader_links) {
-        const fs::path source = (swiftshader_dir / link.target).lexically_normal();
-        if (!fs::exists(source)) {
-            std::cout << "swiftshader source missing: " << source << '\n';
-            continue;
-        }
-
-        fs::create_directories(swiftshader_dir);
-        const fs::path link_path = swiftshader_dir / link.link_name;
-        const auto status = fs::symlink_status(link_path);
-        if (fs::is_symlink(status)) {
-            if (fs::read_symlink(link_path) == link.target) {
-                continue;
-            }
-            fs::remove(link_path);
-        } else if (fs::exists(status)) {
-            std::cout << "swiftshader file already exists: " << link_path << '\n';
-            continue;
-        }
-
-        fs::create_symlink(link.target, link_path);
-        std::cout << "linked: " << link_path << " -> " << link.target.string() << '\n';
-        changed = true;
-    }
-
-    return changed;
-}
-
-bool remove_swiftshader_layout(const fs::path& game_dir) {
-    const fs::path swiftshader_dir = game_dir / k_swiftshader_dir_rel;
-    bool changed = false;
-
-    for (const auto& link : k_swiftshader_links) {
-        const fs::path link_path = swiftshader_dir / link.link_name;
-        const auto status = fs::symlink_status(link_path);
-        if (!fs::is_symlink(status) || fs::read_symlink(link_path) != link.target) {
-            continue;
-        }
-
-        fs::remove(link_path);
-        std::cout << "removed: " << link_path << '\n';
-        changed = true;
-    }
-
-    if (fs::exists(swiftshader_dir) && fs::is_empty(swiftshader_dir)) {
-        fs::remove(swiftshader_dir);
-    }
-
-    return changed;
-}
-
 void status_one(const fs::path& game_dir, const target_patch_t& target) {
     const fs::path target_path = game_dir / target.relative_target;
     const fs::path helper_path = game_dir / "bin/linux64" / target.helper_name;
@@ -291,25 +222,9 @@ void status_one(const fs::path& game_dir, const target_patch_t& target) {
     std::cout << "  backup: " << (fs::exists(backup) ? "present" : "missing") << '\n';
 }
 
-void status_swiftshader_layout(const fs::path& game_dir) {
-    const fs::path swiftshader_dir = game_dir / k_swiftshader_dir_rel;
-
-    std::cout << k_swiftshader_dir_rel << '\n';
-    for (const auto& link : k_swiftshader_links) {
-        const fs::path link_path = swiftshader_dir / link.link_name;
-        const auto status = fs::symlink_status(link_path);
-        std::cout << "  " << link.link_name.string() << ": ";
-        if (fs::is_symlink(status)) {
-            std::cout << "symlink -> " << fs::read_symlink(link_path).string() << '\n';
-        } else {
-            std::cout << (fs::exists(status) ? "present" : "missing") << '\n';
-        }
-    }
-}
-
 void usage() {
     std::cout
-        << "usage: gmod-patcher [status|apply|remove] [--game-dir PATH]\n";
+        << "usage: css-patcher [status|apply|remove] [--game-dir PATH]\n";
 }
 
 } // namespace
@@ -339,7 +254,7 @@ int main(int argc, char** argv) {
 
         const auto game_dir = find_game_dir(game_dir_override);
         if (!game_dir) {
-            std::cerr << "GarrysMod install not found\n";
+            std::cerr << "Counter-Strike Source install not found\n";
             return 1;
         }
 
@@ -349,7 +264,6 @@ int main(int argc, char** argv) {
             for (const auto& target : k_targets) {
                 status_one(*game_dir, target);
             }
-            status_swiftshader_layout(*game_dir);
             return 0;
         }
 
@@ -358,7 +272,6 @@ int main(int argc, char** argv) {
             for (const auto& target : k_targets) {
                 changed |= apply_one(*game_dir, target);
             }
-            changed |= ensure_swiftshader_layout(*game_dir);
             std::cout << (changed ? "apply: changed\n" : "apply: no-op\n");
             return 0;
         }
@@ -368,7 +281,6 @@ int main(int argc, char** argv) {
             for (const auto& target : k_targets) {
                 changed |= remove_one(*game_dir, target);
             }
-            changed |= remove_swiftshader_layout(*game_dir);
             std::cout << (changed ? "remove: changed\n" : "remove: no-op\n");
             return 0;
         }

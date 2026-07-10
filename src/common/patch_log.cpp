@@ -15,7 +15,7 @@ std::mutex& log_mutex() {
     return mutex;
 }
 
-constexpr const char* k_log_path = "/tmp/gmod_patcher.log";
+constexpr const char* k_log_path = "/tmp/css_patcher.log";
 
 } // namespace
 
