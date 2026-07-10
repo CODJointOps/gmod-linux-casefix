@@ -61,7 +61,7 @@ std::vector<std::byte> read_file(const fs::path& path) {
 }
 
 void write_file_atomic(const fs::path& path, const std::vector<std::byte>& bytes) {
-    const fs::path temp = path.string() + ".tmp-casefix";
+    const fs::path temp = path.string() + ".tmp-gmod-patcher";
     {
         std::ofstream file(temp, std::ios::binary | std::ios::trunc);
         if (!file) {

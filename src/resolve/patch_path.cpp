@@ -1,6 +1,6 @@
-#include "resolve/casefix_path.h"
+#include "resolve/patch_path.h"
 
-#include "common/casefix_debug.h"
+#include "common/patch_debug.h"
 
 #include <algorithm>
 #include <array>

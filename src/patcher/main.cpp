@@ -17,12 +17,14 @@ namespace fs = std::filesystem;
 
 namespace {
 
+// One helper, one host file. filesystem_stdio_client.so is loaded by the game
+// client (and by listen servers, which run in-process), so patching it covers
+// every player. Standalone dedicated servers (filesystem_stdio.so) are out of
+// scope -- a rare, technical case that doesn't need this.
 constexpr std::string_view k_client_target_rel = "bin/linux64/filesystem_stdio_client.so";
-constexpr std::string_view k_server_target_rel = "bin/linux64/filesystem_stdio.so";
 constexpr std::string_view k_backup_dir_rel = "bin/linux64/.gmod-fixes-backup";
 constexpr std::string_view k_swiftshader_dir_rel = "bin/linux64/swiftshader";
-constexpr std::string_view k_client_helper = "libgmod_casefix_client.so";
-constexpr std::string_view k_server_helper = "libgmod_casefix_server.so";
+constexpr std::string_view k_helper = "libgmod_patch.so";
 
 struct target_patch_t {
     std::string helper_name{};
@@ -34,9 +36,8 @@ struct swiftshader_link_t {
     fs::path target{};
 };
 
-const std::array<target_patch_t, 2> k_targets = {{
-    {std::string(k_client_helper), fs::path(k_client_target_rel)},
-    {std::string(k_server_helper), fs::path(k_server_target_rel)},
+const std::array<target_patch_t, 1> k_targets = {{
+    {std::string(k_helper), fs::path(k_client_target_rel)},
 }};
 
 const std::array<swiftshader_link_t, 4> k_swiftshader_links = {{
@@ -71,8 +72,7 @@ fs::path exe_dir() {
 
 bool is_gmod_root(const fs::path& root) {
     return fs::exists(root / "hl2.sh") &&
-           fs::exists(root / k_client_target_rel) &&
-           fs::exists(root / k_server_target_rel);
+           fs::exists(root / k_client_target_rel);
 }
 
 std::vector<fs::path> parse_libraryfolders(const fs::path& vdf_path) {
@@ -309,7 +309,7 @@ void status_swiftshader_layout(const fs::path& game_dir) {
 
 void usage() {
     std::cout
-        << "usage: gmod-linux-casefix [status|apply|remove] [--game-dir PATH]\n";
+        << "usage: gmod-patcher [status|apply|remove] [--game-dir PATH]\n";
 }
 
 } // namespace

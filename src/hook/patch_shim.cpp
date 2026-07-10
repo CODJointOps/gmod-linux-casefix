@@ -1,7 +1,7 @@
-#include "common/casefix_debug.h"
-#include "common/casefix_target.h"
-#include "hook/casefix_elf.h"
-#include "resolve/casefix_path.h"
+#include "common/patch_debug.h"
+#include "common/patch_target.h"
+#include "hook/patch_elf.h"
+#include "resolve/patch_path.h"
 
 #include <cerrno>
 #include <cstdarg>
@@ -303,7 +303,7 @@ void install_hooks() {
 } // namespace
 
 __attribute__((constructor))
-static void gmod_casefix_ctor() {
-    debug_log("constructor loaded target=%s log=%s", k_target_module, casefix_log::path());
+static void gmod_patch_fs_ctor() {
+    debug_log("constructor loaded target=%s log=%s", k_target_module, patch_log::path());
     install_hooks();
 }

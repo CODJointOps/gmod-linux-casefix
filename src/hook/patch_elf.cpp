@@ -1,7 +1,7 @@
-#include "hook/casefix_elf.h"
+#include "hook/patch_elf.h"
 
-#include "common/casefix_debug.h"
-#include "common/casefix_target.h"
+#include "common/patch_debug.h"
+#include "common/patch_target.h"
 
 #include <cstdio>
 #include <cstring>

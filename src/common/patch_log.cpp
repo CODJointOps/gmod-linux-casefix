@@ -1,4 +1,4 @@
-#include "casefix_log.h"
+#include "patch_log.h"
 
 #include <cstdarg>
 #include <cstdio>
@@ -7,7 +7,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-namespace casefix_log {
+namespace patch_log {
 namespace {
 
 std::mutex& log_mutex() {
@@ -15,7 +15,7 @@ std::mutex& log_mutex() {
     return mutex;
 }
 
-constexpr const char* k_log_path = "/tmp/gmod_casefix.log";
+constexpr const char* k_log_path = "/tmp/gmod_patcher.log";
 
 } // namespace
 
@@ -54,5 +54,5 @@ void write(std::string_view helper_name, const char* fmt, ...) {
     std::fclose(file);
 }
 
-} // namespace casefix_log
+} // namespace patch_log
 
